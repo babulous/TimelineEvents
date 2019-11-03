@@ -124,7 +124,7 @@ end
 
 ## Installation
 
-Just drop the tlevent folder into the top level of your code and type:
+Just drop the tlevent folder into your code and type:
 
 ```lua
 local E = require "tlevent"
