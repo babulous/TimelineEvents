@@ -1,6 +1,7 @@
 # TimelineEvents
 A coroutine based event system for Lua/LÖVE
 
+FYI, this whole thing is being reworked at the moment and the API will change (for the better). Only use this if you want to experiment with it at the moment.
 
 ## How to Use Timeline Events
 
