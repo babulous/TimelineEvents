@@ -1,908 +1,444 @@
--- MIT License
--- 
--- Copyright (c) 2019 babulous
--- 
--- Permission is hereby granted, free of charge, to any person obtaining a copy
--- of this software and associated documentation files (the "Software"), to deal
--- in the Software without restriction, including without limitation the rights
--- to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
--- copies of the Software, and to permit persons to whom the Software is
--- furnished to do so, subject to the following conditions:
--- 
--- The above copyright notice and this permission notice shall be included in all
--- copies or substantial portions of the Software.
--- 
--- THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
--- IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
--- FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
--- AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
--- LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
--- OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
--- SOFTWARE.
+local O = require 'timeline.oop'
 
-local O = require "tlevent.oop"
+local timeline_stack = { }
 
-local E = { G = { }, O = { } }
-
-local _itdbg
-
--- error handling
-
-local lua_pcall  = pcall
-local lua_xpcall = xpcall
-
-local _TLE_TIMELINE_DIE = { }
-
-local traceback = { }
-
-local error_mt = {
-  __tostring = function(self)
-    return self.TracebackString
-  end
-}
-local function timeline_error(err, level)
-  if is_graphics_pushed then
-    pop_graphics()
-  end
-
-  local db_traceback = debug.traceback(err)
-  local db_string    = tostring(db_traceback)
-  local tl_traceback = { }
-  for i = 1, #traceback do
-    tl_traceback[i] = traceback[i]
-  end
-
-  error(setmetatable({
-    Traceback         = db_traceback,
-    TracebackString   = db_string,
-    TimelineTraceback = tl_traceback,
-  }, error_mt), -2 + (level or 0))
-end
-local function timeline_assert(case, err)
-  if not case then
-    timeline_error(err, -1)
-  end
-  return case
+-- ugly hack to avoid multiple stack traces in error messages
+local debug_traceback = debug.traceback
+local ignore_traceback = 0
+function debug.traceback(...)
+  if ignore_traceback > 0 then ignore_traceback = ignore_traceback - 1; return ""
+  else                         return debug_traceback(...) end
 end
 
-local function push_timeline(self)
-  timeline_assert(#traceback < 100000, "timeline overflow")
-  table.insert(traceback, self)
-  local parent = self.Parent
-  while parent do
-    parent = parent.Parent
-  end
+local tl_err
+local function safety_error(msg)
+  ignore_traceback = 2
+  error("Timeline Error: \n\n" .. msg, -1)
 end
-local function pop_timeline(self)
-  timeline_assert(#traceback > 0, "reached end of timeline stack")
-  timeline_assert(traceback[#traceback] == self, "uh oh")
-  table.remove(traceback)
-end
-
-local function get_current_timeline()
-  return traceback[#traceback]
-end
-
-local function is_functionable(v)
-  if type(v) ~= "function" then
-    if type(v) == "table" then
-      local mt = getmetatable(v)
-      return not not mt.__call
-    else return false end
-  end
-  return true
-end
-setmetatable(E, {
-  __newindex = function(self, k, v)
-    if not is_functionable(v) then rawset(self, k, v)
-    else
-      rawset(self, k, function(...)
-        timeline_assert(#traceback > 0, "events must be called inside of a timeline")
-        return v(...)
-      end)
-    end
-  end
-})
-setmetatable(E.O, {
-  __newindex = function(self, k, v)
-    if not is_functionable(v) then rawset(self, k, v)
-    else
-      rawset(self, k, function(...)
-        timeline_assert(#traceback == 0, "outer events must be called outside of timelines")
-        return v(...)
-      end)
-    end
-  end
-})
-
--- maximums
-
-_TLE_MAX_BRANCH_RULES    = 25000
-_TLE_MAX_ITERATIONS      = 10000
-_TLE_MAX_BRANCHES        = 10000
-_TLE_MAX_SINGLE_BRANCHES = 500
-
--- utility
-
-local Cache = O.Class("Cache", function(C)
-  function C:Pop()
-    if #self.Data > 0 then 
-      return table.remove(self.Data)
-    end
-  end
-  function C:Push(dat)
-    self:Reset(dat)
-    if #self.Data < self.Max then
-      table.insert(self.Data, dat)
-    end
-  end
-  function C:Has()
-    return #self.Data > 0
-  end
-
-  return function(self, max, reset)
-    self.Reset = reset or function()end
-    self.Max   = max or math.huge
-    self.Data  = { }
-  end
-end)
-
--- the meat
-  
-local function coalesce(success, ...)
+local function safety_coalesce(success, ...)
   if not success then
-    timeline_error(..., -1)
+    safety_error(..., -1)
   end
   return ...
 end
-function SafetyWrapper(f)
+-- this class will wrap timeline run functions in order to
+-- provide better error messages
+local function safety_wrapper(f)
   return function(...)
-    return coalesce(lua_xpcall(f, debug.traceback, ...))
+    return safety_coalesce(xpcall(f, debug.traceback, ...))
   end
 end
 
-local Timeline = O.Class("Timeline", function(C, Timeline)
-  Timeline.ActiveTimelines = { }
-  Timeline.InstantaneousBranchCount = 0
-  Timeline.TCache = Cache(_TLE_MAX_BRANCHES, function(self, data)
-    Timeline.ActiveTimelines[data.ID] = nil
-    data.ID        = nil
-    data.Run       = nil
-    data.Status    = "Dead"
-    data.IsAuto    = false
-    data.IsPassive = false
-    for passive in pairs(data.Passives) do passive:Release(); data.Passives[passive] = nil end
-    for i = 1, #data.Args    do data.Args   [i] = nil end
-    for i = 1, #data.Results do data.Results[i] = nil end
-  end)
 
-  local default_tostring = Timeline.__tostring
-  function Timeline:__tostring()
-    local str = default_tostring(self)
-    return str:gsub("Timeline", "Timeline[" .. tostring(self.ID) .. "]")
+local function timeline_error(msg)
+  print(msg)
+  error(msg, -1)
+end
+local function timeline_coalesce(tl, success, ...)
+  if not success then
+    timeline_error(...)
   end
+  if coroutine.status(tl._coroutine) == "dead" and select("#", ...) > 0 then
+    tl._results = { ... }
+  end
+end
+local function timeline_resume(tl)
+  if coroutine.status(tl._coroutine) ~= "dead" then
+    timeline_coalesce(tl, coroutine.resume(tl._coroutine, unpack(tl._args)))
+  end
+end
 
-  function Timeline.Get(id)
-    return Timeline.ActiveTimelines[id]
-  end
 
-  local function safe_resume(cr, ...)
-    local success, err = coroutine.resume(cr, ...)
-    if not success then
-      timeline_error(err, -2)
-    end
-  end
+-- timelines!! the heart of tle
+TL = O.Class("Timeline", function(C, MT)
+  C._status      = "Suspended"
+  C._is_paused   = false
 
-  local function pcall_coalesce(success, ...)
-    if not success then
-      if ... == _TLE_TIMELINE_DIE then
-        timeline_error(_TLE_TIMELINE_DIE)
-      end
-    end
-    return success, ...
-  end
-  local function running_pcall(...)
-    return pcall_coalesce(lua_pcall(...))
-  end
-  local xpcall_user_errhand
-  local function xpcall_errhand(...)
-    if ... == _TLE_TIMELINE_DIE then
-      return _TLE_TIMELINE_DIE
-    end
-    return xpcall_user_errhand(...)
-  end
-  local function running_xpcall(f, errhand, ...)
-    xpcall_user_errhand = errhand
-    return pcall_coalesce(lua_xpcall(f, xpcall_errhand, ...))
-  end
+  MT.Event   = { }
+  MT.Trigger = { }
 
-  local function set_status(self, status)
-    if self.Status ~= status then
-      if self.Status == "Running" then
-         pcall = lua_pcall
-        xpcall = lua_xpcall
-      elseif status == "Running" then
-         pcall = running_pcall
-        xpcall = running_xpcall
-      end
-      self.Status = status
-    end
-  end
-
-  local function remove_branch(self, i)
-    local tl = table.remove(self.Branches, i)
-    if tl.Status ~= "Dead" then
-      tl:Release()
-    end
-  end
-  function C:Branch(tl)
-    timeline_assert(self.Status == "Running", "attempt to branch a timeline that isn't running")
-
-    table.insert(self.Branches, tl)
-    set_status(self, "Normal")
-    tl:Update()
-    set_status(self, "Running")
-  end
-
-  function C:AddPassive(passive)
-    self.Passives[passive] = true
-    passive:Update()
-  end
-  function C:GetResults()
-    return unpack(self.Results)
-  end
-
-  function C:IsDone()
-    return self.Status                      == "Dead" or 
-           self.Status                      == "Finished" or 
-           coroutine.status(self.Coroutine) == "dead"
-  end
-  function C:IsRunning()
-    return self.Status == "Running" or
-           self.Status == "Normal"
-  end
-
-  local function check_completion(self)
-    if self.Status == "Finished" then
-      pop_timeline(self)
-      self:Kill()
-      return true
-    elseif self:IsDone() then
-      pop_timeline(self)
-      set_status(self, "Dead")
-      return true
-    elseif self.Status == "Paused" then
-      pop_timeline(self)
-      return true
-    end
-    return false
-  end
-  function C:Update()
-    if     self.Status == "Paused" then return
-    elseif self:IsDone()           then timeline_error("attempt to resume a dead timeline", -1)
-    elseif self:IsRunning()        then timeline_error("attempt to resume a running timeline", -1)
-    else
-      self.Wait = 0
-      push_timeline(self)
-
-      for passive in pairs(self.Passives) do
-        passive.Wait = passive.Wait + 1
-        if passive.Wait > 1 then passive:Kill() end
-        if passive:IsDone() then
-          self.Passives[passive] = nil
-          passive:Release()
-        elseif passive.IsAuto then
-          passive:Update()
-        end
-      end
-
-      set_status(self, "Running")
-      local success, err = coroutine.resume(self.Coroutine)
-      if not success then 
-        timeline_error(err)
-      end
-
-      if check_completion(self) then return end
-      set_status(self, "Normal")
-
-      for i, tl in ipairs(self.Branches) do
-        if not tl:IsDone() then tl:Update() end
-      end
-      for i = #self.Branches, 1, -1 do
-        local tl = self.Branches[i]
-        if tl:IsDone() then
-          remove_branch(self, i)
-        end
-      end
-
-      pop_timeline(self)
-      set_status(self, "Suspended")
-    end
-  end
-
-  function C:Release()
-    timeline_assert(self:IsDone(), "attempt to release a running timeline")
-    for _, tl in ipairs(self.Branches) do
-      tl:Release()
-    end
-    Timeline.TCache:Push(self)
-  end
-  function C:KillBranches()
-    for _, branch in pairs(self.Branches) do
-      if not branch:IsDone() then
-        branch:Kill()
-      end
-    end
-    for passive in pairs(self.Passives) do
-      if not passive:IsDone() then
-        passive:Kill()
-      end
-    end
-  end
-  function C:Kill()
-    timeline_assert(self.Status ~= "Dead", "attempt to kill a timeline that's already dead")
-    local status = self.Status
-    set_status(self, "Dead")
-    self:KillBranches()
-    if status == "Running" then
-      self:Step()
-    end
-  end
+  function C:_yield () coroutine.yield() end
+  function C:_resume() timeline_resume(self) end
 
   function C:Step()
-    coroutine.yield()
-    if self:IsDone() then
-      error(_TLE_TIMELINE_DIE)
+    if self._status ~= "Dead" and not self._is_paused then
+      timeline_stack[#timeline_stack + 1] = self
+      local branch_count = #self._branches
+      self._status = "Running"
+      self:_resume()
+
+      self._status = "Delegating"
+      for i = 1, branch_count do
+        self._branches[i]:Step()
+      end
+      for i = #self._branches, 1, -1 do
+        if self._branches[i]:GetStatus() == "Dead" then
+          table.remove(self._branches, i)
+        end
+      end
+
+      if #self._branches == 0 and coroutine.status(self._coroutine) == "dead" then
+        self._status = "Dead"
+      else
+        self._status = "Suspended"
+      end
+      timeline_stack[#timeline_stack] = nil
+    end
+    return self:IsDone()
+  end
+
+  function C:IsRunning () return self._status == "Running" or self._status == "Delegating" end
+  function C:IsDone    () return self._status == "Dead" end
+  function C:GetStatus () return self._status end
+  function C:HasResults() return #self._results > 0 end
+  function C:GetResults() return unpack(self._results) end
+
+  function C:Branches() return ipairs(self._branches) end
+
+  function C:Pause() 
+    self._is_paused = true
+    if self:IsRunning() then
+      TL.Step()
     end
   end
-  function C:Pause()
-    local status = self.Status
-    set_status(self, "Paused")
-    if status == "Running" then
-      self:Step()
+  function C:Unpause()
+    self._is_paused = false 
+  end
+  function C:IsPaused() return self._is_paused end
+
+  function C:Branch(run, ...)
+    local b  = TL(run, ...)
+    self._branches[#self._branches + 1] = b
+    return b
+  end
+
+  function C:KillBranches()
+    for i = 1, #self._branches do
+      self._branches[i]:Die()
+      self._branches[i] = nil
     end
   end
-  function C:Resume()
-    if self.Status == "Paused" then
-      set_status(self, "Suspended")
-      self:Update()
+  function C:Die()
+    self:KillBranches()
+    if self:IsRunning() then
+      self._status = "Dead"
+      TL.Step()
+    else
+      self._status = "Dead"
     end
   end
 
-  local function pcall_run(err)
-    if err == _TLE_TIMELINE_DIE then return err
-    else                                  return debug.traceback(err) end
-  end
-  local function coalesce(self, success, ...)
-    if success then
-      self.Status = "Finished"
-      for i = 1, select("#", ...) do
-        self.Results[i] = select(i, ...)
-      end
-      coroutine.yield()
-    else
-      if ... ~= _TLE_TIMELINE_DIE then
-        timeline_error(..., -1)
-      end
-    end
-  end
-  local coroutine_run = SafetyWrapper(function(self)
-    while true do
-      coroutine.yield()
-      coalesce(self, lua_xpcall(self.Run, pcall_run, unpack(self.Args)))
-    end
-  end)
-  function Timeline:New()
-    if Timeline.TCache:Has() then
-      local tl = Timeline.TCache:Pop()
-      if coroutine.status(tl.Coroutine) == "dead" then
-        tl.Coroutine = coroutine.create(coroutine_run)
-      end
-      safe_resume(tl.Coroutine, tl)
-      return tl
-    else
-      Timeline.InstantaneousBranchCount = Timeline.InstantaneousBranchCount + 1
-      if Timeline.InstantaneousBranchCount > _TLE_MAX_SINGLE_BRANCHES then
-        timeline_error("branch overflow")
-      end
-
-      local instance = setmetatable({
-        Branches  = { },
-        Passives  = { },
-        Args      = { },
-        Results   = { },
-        Coroutine = coroutine.create(coroutine_run),
-      }, self)
-      safe_resume(instance.Coroutine, instance)
-      return instance
-    end
-  end
-  local id = 0
   return function(self, run, ...)
-    timeline_assert(type(run) == "table" or type(run) == "function", "bad branch function")
-
-    id = (id + 1) % 1e300
-    Timeline.ActiveTimelines[id] = self
-
-    for i = 1, select("#", ...) do
-      self.Args[i] = select(i, ...)
+    if type(run) ~= "function" then
+      local success = false
+      if type(run) == "table" then
+        success = getmetatable(run).__call
+      end
+      assert(success, "attempt to pass uncallable value to timeline constructor")
     end
-    self.Wait   = 0
-    self.Run    = run
-    self.ID     = id
-    set_status(self, "Suspended")
+
+    self._coroutine = coroutine.create(safety_wrapper(run))
+    self._args      = { ... }
+    self._results   = { }
+    self._branches  = { }
   end
 end)
 
-local function get_timeline(id)
-  if id then 
-    if id < 0 then
-      return timeline_assert(traceback[#traceback + id], "attempt to get nonexistent relative timeline")
-    else
-      return timeline_assert(Timeline.Get(id), "attempt to perform operation on dead timeline") 
-    end
-  end
-  return get_current_timeline()
-end
+package.loaded['timeline'] = TL
 
--- some globals
+-- Utility --
 
 local delta_time = 0
-local frame = 0
-function E.G.GetDeltaTime() return delta_time end
-function E.G.GetFrame    () return frame end
+local frame      = 0
+function TL.GetDT   () return delta_time end
+function TL.GetFrame() return frame end
 
-function E.G.KillBranches(id) get_timeline(id):KillBranches() end
-function E.G.Kill(id) 
-  assert(id, "Kill requires an id")
-  get_timeline(id):Kill() 
-end
-
-function E.G.IsDone(id)
-  local tl = Timeline.Get(id)
-  if tl then return tl:IsDone() 
-  else       return true end
-end
-function E.G.IsRunning(id)
-  local tl = Timeline.Get(id)
-  if tl then return tl:IsRunning() 
-  else       return false end
-end
-
-function E.G.Status(id)
-  local tl = Timeline.Get(id) or get_current_timeline()
-  if tl then return tl.Status
-  else       return "Dead" end
-end
-
-
-function E.GetID() return get_timeline().ID end
-
--- built-in events
-
---function E.Resume(id) get_timeline(id):Resume() end
---function E.Pause (id) get_timeline(id):Pause() end
-
-function E.Die() E.Kill(get_current_timeline().ID) end
-
-function E.Step()
-  return get_current_timeline():Step()
-end
-function E.When(f)
-  repeat E.Step() until f()
-end
-function E.Wait(t)
-  while t > 0 do
-    E.Step()
-    t = t - E.G.GetDeltaTime()
+local loop_count = 0
+function TL.CheckInfiniteLoop(...)
+  loop_count = loop_count + 1
+  if loop_count > 100000 then 
+   error("infinite loop detected, try calling TL.Step()")
   end
+  if select("#", ...) == 0 then return true
+  else                          return ... end
 end
 
-function E.WaitForTimeline(id)
-  local tl = get_timeline(id)
-  repeat E.Step() until tl:IsDone() or tl.ID ~= id
+local background_timelines = { }
+function TL.Do(run)
+  local tl = TL(run)
+  background_timelines[#background_timelines + 1] = tl
+  return tl
 end
-function E.PollBranchStatus(id, status)
-  if status == "Dead" then
-    return E.WaitForBranches(id)
+
+local TimelinePeeper = O.Class("TimelinePeeper", TL, function(C)
+  local _PEEK_FINISHED = { }
+  function C:_yield()
+    error(_PEEK_FINISHED)
   end
-  local tl = get_timeline(id)
-  repeat E.Step() until tl.Status == status
-end
-function E.WaitForBranches(id)
-  local tl = get_timeline(id)
-  while #tl.Branches > 0 do E.Step() end
-end
 
-
-function E.IsPassiveDone(id) 
-  local passive = Timeline.Get(id)
-  if passive then return passive:IsDone()
-  else            return true end
-end
-function E.GetPassiveResults(id)
-  local passive = Timeline.Get(id)
-  if passive then
-    timeline_assert(passive:IsDone(), "attempt to get results from a running passive event")
-    return passive:GetResults()
-  end
-  return nil
-end
-function E.PassiveStep(...)
-  for i = 1, select("#", ...) do
-    local passive = Timeline.Get(select(i, ...))
-    if passive then 
-      passive:Update() 
+  local function peep_coalesce(tl, success, ...)
+    tl:KillBranches()
+    if not success then
+      if ... == _PEEK_FINISHED then 
+        tl._did_pass = false
+        return
+      else
+        timeline_error(...)
+      end
     end
-  end
-end
-
-local BranchRule = O.Class("BranchRule", function(C, BranchRule)
-  BranchRule.BRCache = Cache(_TLE_MAX_BRANCH_RULES)
-
-  function C:Make(run, ...)
-    timeline_assert(type(run) == "table" or type(run) == "function", "bad branch function")
-    local br = BranchRule(self.Rule, run)
-    local tl = Timeline(br, ...)
-    return tl
-  end
-  function C:Branch(run, ...)
-    local tl = self:Make(run, ...)
-    get_current_timeline():Branch(tl)
-    BranchRule.BRCache:Push(br)
-    return tl
-  end
-  function C:Create(run, ...)
-    local tl = self:Make(run, ...)
-    tl:Update()
-    BranchRule.BRCache:Push(br)
-    return tl
+    tl._did_pass = true
+    for i = 1, select("#", ...) do tl._results[i] = select(i, ...) end
   end
 
-  function BranchRule:__call(...)
-    E.Step()
-    return self.Rule(self.Run, ...)
+  function C:_set(run, ...)
+    for i = 1, #self._results   do self._results[i] = nil end
+    for i = 1, #self._args      do self._args   [i] = nil end
+    for i = 1, select("#", ...) do self._args   [i] = select(i, ...) end
+    self._run         = run
+    self._status      = "Suspended"
+    self._is_finished = false
   end
 
-  local function coalesce_results(self, ...)
-    for i = 1, select("#", ...) do
-      self.Results[i] = select(i, ...)
-    end
-  end
-  function BranchRule:New()
-    if BranchRule.BRCache:Has() then
-      local instance = BranchRule.BRCache:Pop()
-      return instance
-    else
-      local instance = setmetatable({ }, self)
-      return instance
-    end
-  end
-  return function(self, rule, run)
-    self.Run  = run
-    self.Rule = rule
+  return function(self)
+    self._coroutine = coroutine.create(function()
+      while true do
+        coroutine.yield()
+        peep_coalesce(self, xpcall(self._run, debug.traceback, unpack(self._args)))
+      end
+    end)
+    self._args      = { }
+    self._results   = { }
+    self._branches  = { }
   end
 end)
 
-local function rule_coalesce(f, ...) f(); return ... end
-local rules = {
-  ["patient"] = BranchRule(function(run, ...)
-    return rule_coalesce(E.WaitForBranches, run(...))
-  end),
-  ["immediate"] = BranchRule(function(run, ...)
-    return run(...)
-  end),
-  ["loop"] = BranchRule(function(run, ...)
-    local iteration = 0
-    while iteration < _TLE_MAX_ITERATIONS do
-      local frame = E.G.GetFrame()
-      run(...)
-      if frame ~= E.G.GetFrame() then iteration = 0
-      else                        iteration = iteration + 1 end
+local peeper_stack = { TimelinePeeper(), _index = 0 }
+local function get_peeper()
+  return peeper_stack[peeper_stack._index + 1]
+end
+
+function TL.DidPeekTrigger() return get_peeper()._did_pass end
+function TL.GetPeekResults() return get_peeper():GetResults() end
+function TL.Peek(run, ...)
+  peeper_stack._index = peeper_stack._index + 1
+  if not peeper_stack[peeper_stack._index] then
+    peeper_stack[peeper_stack._index] = TimelinePeeper()
+  end
+
+  local peeper = peeper_stack[peeper_stack._index]
+  peeper:_set(run, ...)
+  peeper:Step()
+  peeper_stack._index = peeper_stack._index - 1
+  return TL.DidPeekFinish(), TL.GetPeekResults()
+end
+
+function TL.Assert(msg)
+  assert(timeline_stack[#timeline_stack], msg or "cannot call this function outside of a Timeline")
+end
+
+function TL.Step()
+  TL.Assert()
+  TL.Current():_yield()
+end
+
+function TL.Current()
+  return timeline_stack[#timeline_stack]
+end
+
+-- Events --
+
+function TL.Event.Kill(n)
+  n = n or 0
+  TL.Assert()
+  assert(n <= 0, "TL.Event.Kill only accepts negative numbers or 0")
+  assert(#timeline_stack >= -n, "attempt to kill a timeline outside of the stack")
+  timeline_stack[#timeline_stack + n]:Die()
+end
+
+function TL.Event.Die()
+  TL.Assert()
+  TL.Current():Die()
+end
+
+function TL.Event.Branch(run, ...)
+  TL.Assert()
+  local b = TL.Current():Branch(run, ...)
+  local success, err = pcall(TL.Step, b)
+  if not success then error(err) end
+  return b
+end
+
+function TL.Event.Wait(t)
+  while t > 0 do
+    TL.Step()
+    t = t - TL.GetDT()
+  end
+  return t
+end
+
+function TL.Trigger.OnTimelineDone(t)
+  assert(t ~= TL.Current(), "attempt to wait for the currently running timeline")
+  while not t:IsDone() do TL.Step() end
+  return t:GetResults()
+end
+
+function TL.Trigger.OnBranchesDone(t)
+  t = t or TL.Current()
+  while next(t._branches) do TL.Step() end
+end
+
+-- Input Events --
+
+local function new_on_trigger(name, narg)
+  return function(...)
+    while true do
+      for a, b, c, d in TL.Trigger[name]("All") do
+        local arg = select(narg, a, b, c, d)
+        for i = 1, select("#", ...) do
+          if arg == select(i, ...) then
+            return arg
+          end
+        end
+      end
+      TL.Step()
     end
-    timeline_error("iteration overflow", -1)
-  end)
-}
-
-local function parse_branch_args(...)
-  local args_i = 3
-  local rule, f = ...
-  if type(rule) ~= "string" then
-    args_i = 2
-    rule   = "patient"
-    f      = ...
   end
-  return f, rule, args_i
 end
-getmetatable(E).__call = function(_, ...)
-  local f, rule, args_i = parse_branch_args(...)
-  local tl = rules[rule]:Create(f, select(args_i, ...))
-  return tl.ID
-end
-function E.Branch(...)
-  local f, rule, args_i = parse_branch_args(...)
-  local tl = rules[rule]:Branch(f, select(args_i, ...))
-  return tl.ID
-end
-function E.Passive(...)
-  local f, rule, args_i = parse_branch_args(...)
-  local passive = rules[rule]:Make(f, select(args_i, ...))
-  get_current_timeline():AddPassive(passive)
-  return passive.ID
-end
-function E.AutoPassive(...)
-  local id = E.Passive(...)
-  get_timeline(id).IsAuto = true
-  return id
-end
+TL.Trigger.OnKeyPress     = new_on_trigger("KeyPressed",      2)
+TL.Trigger.OnMousePress   = new_on_trigger("MousePressed",    3)
+TL.Trigger.OnKeyRelease   = new_on_trigger("KeyReleased",      2)
+TL.Trigger.OnMouseRelease = new_on_trigger("MouseReleased",    3)
 
-local text_input = ""
-local text_input_frame = 0
-function E.PollTextInput()
-  local frame = E.G.GetFrame()
-  repeat E.Step() until text_input_frame > frame
-  return text_input
-end
-
-local button_pressed
-local button_pressed_frame = 0
-local function poll_mouse_press_any()
-  local frame = E.G.GetFrame()
-  repeat E.Step() until button_pressed_frame > frame
-  return button_pressed
-end
-local button_released
-local button_released_frame = 0
-local function poll_mouse_release_any()
-  local frame = E.G.GetFrame()
-  repeat E.Step() until button_released_frame > frame
-  return button_released
-end
-
-local key_pressed
-local key_pressed_frame = 0
-local function poll_key_press_any()
-  local frame = E.G.GetFrame()
-  repeat E.Step() until key_pressed_frame > frame
-  return key_pressed
-end
-local key_released
-local key_released_frame = 0
-local function poll_key_release_any()
-  local frame = E.G.GetFrame()
-  repeat E.Step() until key_released_frame > frame
-  return key_released
-end
-
-local function input_event(test, default, state, ...)
-  if not ... then return default() end
-  local was_equal
-  repeat 
-    was_equal = test(...) == state 
-    E.Step()
-  until test(...) == state and not was_equal
-  return ...
-end
-function E.PollKeyPress    (k) return input_event(love.keyboard.isDown, poll_key_press_any,     true,  k) end
-function E.PollKeyRelease  (k) return input_event(love.keyboard.isDown, poll_key_release_any,   false, k) end
-function E.PollMousePress  (b) return input_event(love.mouse   .isDown, poll_mouse_press_any,   true,  b) end
-function E.PollMouseRelease(b) return input_event(love.mouse   .isDown, poll_mouse_release_any, false, b) end
-
-local wheel_position = 0
-function E.PollMouseWheel()
-  local pos = wheel_position
-  repeat E.Step() until pos ~= wheel_position
-  return wheel_position - pos
-end
-
-local dx, dy = 0, 0
-function E.PollMouseMove()
-  local x1, y1 = love.mouse.getPosition()
-  local x2, y2 = x1, y1
-  while x1 == x2 and y1 == y2 do 
-    E.Step()
-    x2, y2 = love.mouse.getPosition()
-  end
-  return x2 - x1, y2 - y1
-end
-
-local function is_mod_down(mod)
-  if     mod == "ctrl"  then return love.keyboard.isDown("lctrl")  or love.keyboard.isDown("rctrl")
-  elseif mod == "alt"   then return love.keyboard.isDown("lalt")   or love.keyboard.isDown("ralt")
-  elseif mod == "shift" then return love.keyboard.isDown("lshift") or love.keyboard.isDown("rshift") end
-end
-function E.PollHotkey(hotkey)
-  local hk = { nil, nil, nil }
-  local key
-  local i = 1 
-  while i < #hotkey do
-    local s = hotkey:match("[^%+]+%+", i)
-    hk[#hk + 1] = s:sub(1, #s - 1)
-    i = i + #s
-  end
-  key = hotkey:sub(i, i)
-
-  repeat
-    local k = E.PollKeyPress()
-    local is_good = true
-    for i = 1, #hk do
-      if not is_mod_down(hk[i]) then
-        is_good = false
-        break
+local function new_on_trigger_joystick(name, narg)
+  return function(joystick, ...)
+    while true do
+      for jstick, b, c, d in TL.Trigger[name]("All") do
+        local arg = select(narg, jstick, b, c, d)
+        for i = 1, select("#", ...) do
+          if arg == select(i, ...) then
+            return arg
+          end
+        end
       end
     end
-  until is_good and k == key 
-end
-
-function E.PollMouseActivity()
-  local pmm = E.Passive(E.PollMouseMove)
-  local pmp = E.Passive(E.PollMousePress)
-  local pmr = E.Passive(E.PollMouseRelease)
-  local pmw = E.Passive(E.PollMouseWheel)
-  while true do
-    E.Step()
-    E.PassiveStep(pmm, pmp, pmr, pmw)
-    if E.IsPassiveDone(pmm) then return "MouseMoved",    E.GetPassiveResults(pmm) end
-    if E.IsPassiveDone(pmp) then return "MousePressed",  E.GetPassiveResults(pmp) end
-    if E.IsPassiveDone(pmr) then return "MouseReleased", E.GetPassiveResults(pmr) end
-    if E.IsPassiveDone(pmw) then return "MouseWheel",    E.GetPassiveResults(pmw) end
   end
 end
+TL.Trigger.OnGamepadPress    = new_on_trigger_joystick("GamepadPressed",  2)
+TL.Trigger.OnJoystickPress   = new_on_trigger_joystick("JoystickPressed", 2)
+TL.Trigger.OnGamepadRelease  = new_on_trigger_joystick("GamepadReleased",  2)
+TL.Trigger.OnJoystickRelease = new_on_trigger_joystick("JoystickReleased", 2)
 
-function E.  Assert()end
-function E.O.Assert()end
+-- LOVE Events --
 
--- outer events
-
-function E.O.Step(id)
-  Timeline.Get(id):Update()
-end
-
-local auto_timelines = { }
-function E.O.Do(...)
-  local id = E(...)
-  auto_timelines[id] = true
-  E.O.Step(id)
-end
-
-function E.O.update(dt)
-  delta_time = dt
-  frame      = frame + 1
-  for id in pairs(auto_timelines) do
-    if E.G.IsDone(id) then auto_timelines[id] = nil
-    else                   E.O.Step(id) end
+local inputs = { Size = 0 }
+local function get_next_input(list)
+  list.Size = list.Size + 1
+  if not list[list.Size] then
+    list[list.Size] = { Type = nil, nil, nil, nil }
   end
+  return list[list.Size]
 end
-function E.O.keypressed(k)
-  key_pressed       = k
-  key_pressed_frame = E.G.GetFrame()
+local function push_input_trigger(typ, ...)
+  local input = get_next_input(inputs)
+  input.Type = typ
+  for i = #input, 1,                -1 do input[i] = nil end
+  for i = 1,      select("#", ...)     do input[i] = select(i, ...) end
 end
-function E.O.keyreleased(k)
-  key_released       = k
-  key_released_frame = E.G.GetFrame()
-end
-function E.O.mousemoved(_, _, ddx, ddy)
-  dx, dy = ddx, ddy
-end
-function E.O.wheelmoved(dx, dy)
-  wheel_position = wheel_position + dy
-end
-function E.O.mousepressed(_, _, button)
-  button_pressed       = button
-  button_pressed_frame = E.G.GetFrame()
-end
-function E.O.mousereleased(_, _, button)
-  button_released       = button
-  button_released_frame = E.G.GetFrame()
-end
-function E.O.textinput(text, ...)
-  if E.G.GetFrame() ~= text_input_frame then
-    text_input       = text
-    text_input_frame = E.G.GetFrame()
-  else
-    text_input = text_input .. text
+local triggers = { "KeyPressed", "KeyReleased", "MousePressed", "MouseReleased", "MouseMoved", 
+  "WheelMoved", "TouchPressed", "TouchReleased", "TouchMoved", "GamepadPressed", 
+  "GamepadReleased", "GamepadAxis", "JoystickPressed", "JoystickReleased", "JoystickAxis", 
+  "JoystickHat", "JoystickAdded", "JoystickRemoved", "TextInput", "Visible", "Resize", 
+  "MouseFocus", "Focus" }
+
+local function new_input_trigger(names)
+  if type(names) == "string" then names = { names } end
+
+  local function iterate()
+    for j = 1, #names do
+      for i = 1, inputs.Size do
+        local input = inputs[i]
+        if input.Type == names[j] then
+          if #names > 1 then coroutine.yield(names[j], unpack(input))
+          else               coroutine.yield(unpack(input)) end
+        end
+      end
+    end
   end
+  local function trigger(all)
+    while TL.CheckInfiniteLoop() do
+      for j = 1, #names do
+        for i = inputs.Size, 1, -1 do
+          local input = inputs[i]
+          if input.Type == names[j] then
+            if all == "All" then return coroutine.wrap(iterate)
+            else
+              if #names > 1 then return names[j], unpack(input)
+              else               return unpack(input) end 
+            end
+          end
+        end
+      end
+      TL.Step()
+    end
+  end
+  return trigger
 end
-function E.O.Attach()
-  local function replace(name)
-    if love[name] then
-      local old = love[name]
-      love[name] = function(...)
-        E.O[name](...)
+
+do
+  for i = 1, #triggers do
+    TL[triggers[i]:lower()] = function(...)
+      push_input_trigger(triggers[i], ...)
+    end
+    TL.Trigger[triggers[i]] = new_input_trigger(triggers[i])
+  end
+
+  TL.Trigger.   MouseActivity = new_input_trigger({ "MousePressed", "MouseReleased", "MouseMoved", 
+                                                    "WheelMoved" })
+  TL.Trigger.  WindowActivity = new_input_trigger({ "MouseFocus", "Focus", "Resize", "Visible" })
+  TL.Trigger.JoystickActivity = new_input_trigger({ "JoystickPressed", "JoystickReleased", 
+                                                    "JoystickAdded", "JoystickRemoved", 
+                                                    "JoystickAxis", "JoystickHat" })
+  TL.Trigger. GamepadActivity = new_input_trigger({ "GamepadPressed", "GamepadReleased", 
+                                                    "GamepadAxis" })
+  TL.Trigger.     KeyActivity = new_input_trigger({ "KeyPressed", "KeyReleased", "TextInput" })
+end
+
+function TL.update(dt)
+  for i = 1, #background_timelines do
+    background_timelines[i]:Step()
+  end
+  for i = #background_timelines, 1, -1 do
+    if background_timelines[i]:GetStatus() == "Dead" then
+      table.remove(background_timelines, i)
+    end
+  end
+
+  delta_time  = dt
+  frame       = frame + 1
+  inputs.Size = 0
+  loop_count  = 0
+end
+
+function TL.Attach()
+  for i = 1, #triggers do
+    local lname = triggers[i]:lower()
+    local old = love[lname]
+    if old then
+      love[lname] = function(...)
+        TL[lname](...)
         old(...)
       end
     else
-      love[name] = E.O[name]
+      love[lname] = TL[lname]
     end
   end
 
-  replace("keypressed")
-  replace("keyreleased")
-  replace("mousemoved")
-  replace("mousereleased")
-  replace("mousepressed")
-  replace("wheelmoved")
-  replace("textinput")
-
-  if love.update then
-    local old = love.update
-    function love.update(...)
-      old(...)
-      E.O.update(...)
-    end
-  else
-    love.update = E.O.update
+  local old_update = love.update or function()end
+  function love.update(...)
+    old_update(...)
+    TL.update(...)
   end
 end
 
--- debug
 
-if _TLE_DEBUG then
-  _itdbg = {
-    Timelines = {
-      Rules = {
-        Active = nil,
-        Stored = nil,
-        Total  = nil,
-      },
-
-      Active = nil,
-      Stored = nil,
-      Total  = nil
-    }
-  }
-
-  function _itdbg.Timelines.Stored()
-    return #Timeline.TCache.Data
-  end
-  function _itdbg.Timelines.Active()
-    local count = 0
-    for _ in pairs(Timeline.ActiveTimelines) do
-      count = count + 1
-    end
-    return count
-  end
-  function _itdbg.Timelines.Total()
-    return _tdbg.Get("Timelines.Stored") + _tdbg.Get("Timelines.Active")
-  end
-
-  function _itdbg.Timelines.Rules.Stored() return #BranchRule.BRCache.Data end
-  function _itdbg.Timelines.Rules.Active() return _tdbg.Get("Timelines.Rules.Stored") end
-  function _itdbg.Timelines.Rules.Total () return _tdbg.Get("Timelines.Rules.Stored") end
-
-  local function split(path)
-    local result = { }
-    for str in string.gmatch(path, "[^%.]+") do
-      result[#result + 1] = str
-    end
-    return result
-  end
-  local function get_path(path)
-    local strpath = path
-    path = split(path)
-    local v = _itdbg
-    for i = 1, #path do
-      timeline_assert(type(v) == "table", "no debug variable at '" .. strpath .. "'")
-      v = v[path[i]]
-    end
-
-    if type(v) == "function" then return v()
-    else                          return v end
-  end
-  local function set_path(path, v)
-    local strpath = path
-    path = split(path)
-    local t = _itdbg
-    for i = 1, #path - 1 do
-      t = t[path[i]]
-      timeline_assert(type(t) == "table", "no debug table at '" .. strpath .. "'")
-    end
-    t[path[#path]] = v
-  end
-
-  _tdbg = { }
-
-  function _tdbg.Get(path) return get_path(path) end
-end
-
-return E
+return TL
