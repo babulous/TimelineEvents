@@ -6,7 +6,7 @@ A coroutine based event system for Lua/LÖVE
 Just drop the timeline folder into your code and type:
 
 ```lua
-local E = require "timeline"
+local TL = require "timeline"
 ```
 
 ## Documentation
