@@ -251,7 +251,7 @@ function TL.Peek(run, ...)
   peeper:_set(run, ...)
   peeper:Step()
   peeper_stack._index = peeper_stack._index - 1
-  return TL.DidPeekFinish(), TL.GetPeekResults()
+  return TL.DidPeekTrigger(), TL.GetPeekResults()
 end
 
 function TL.Assert(msg)
