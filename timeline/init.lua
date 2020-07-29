@@ -20,7 +20,9 @@
 -- OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 -- SOFTWARE.
 
-local O = require 'timeline.oop'
+local PATH = (...):gsub('%.init$', '')
+local DIR_PATH = PATH:gsub("%.", "/")
+local O = require(PATH .. '.oop')
 
 local timeline_stack = { }
 
@@ -75,10 +77,12 @@ end
 TL = O.Class("Timeline", function(C, MT)
   C._status      = "Suspended"
   C._is_paused   = false
+  C._type        = "TLE"
 
   MT.Event   = { }
   MT.Trigger = { }
 
+  function C:type   () return self._type end
   function C:_yield () coroutine.yield() end
   function C:_resume() timeline_resume(self) end
 
