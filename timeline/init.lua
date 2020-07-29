@@ -20,9 +20,7 @@
 -- OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 -- SOFTWARE.
 
-local PATH = (...):gsub('%.init$', '')
-local DIR_PATH = PATH:gsub("%.", "/")
-local O = require(PATH .. '.oop')
+local O = require 'timeline.oop'
 
 local timeline_stack = { }
 
