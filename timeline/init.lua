@@ -191,9 +191,19 @@ function TL.Do(run, ...)
   return tl
 end
 
-function TL.Require(path)
-  local chunk = loadfile(path:gsub("%.", "/"))
-  return TL(chunk, path)
+function TL.Require(modl)
+  local path = modl:gsub("%.", "/")
+  local chunk
+  for searcher in package.path:gmatch("([^;]*);?") do
+    local cpath = searcher:gsub("?", path)
+    chunk = loadfile(cpath)
+    if chunk then break end
+  end
+  if not chunk then
+    chunk = loadfile("../" .. path .. ".lua")
+  end
+  assert(chunk, "cannot find module '" .. modl .. "'")
+  return TL(chunk, modl)
 end
 
 -- Timeline Peeper --
