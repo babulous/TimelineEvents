@@ -6,7 +6,10 @@ A coroutine based event system for Lua/LÖVE
 + Added `TL.Event.Suspend(steps)`
 + Added `"Timeline" = Timeline:type()`
 + Improved error handling and stack traces
-+ Setting up to add graphics capabilities!
+
+## Todo
+
++ Graphics
 
 ## Installation
 
