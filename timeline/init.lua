@@ -1,17 +1,17 @@
 -- MIT License
--- 
--- Copyright (c) 2020 babulous
--- 
+--
+-- Copyright (c) 2020 moo-sama
+--
 -- Permission is hereby granted, free of charge, to any person obtaining a copy
 -- of this software and associated documentation files (the "Software"), to deal
 -- in the Software without restriction, including without limitation the rights
 -- to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
 -- copies of the Software, and to permit persons to whom the Software is
 -- furnished to do so, subject to the following conditions:
--- 
+--
 -- The above copyright notice and this permission notice shall be included in all
 -- copies or substantial portions of the Software.
--- 
+--
 -- THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 -- IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 -- FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
@@ -20,60 +20,46 @@
 -- OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 -- SOFTWARE.
 
-local PATH = (...):gsub('%.init$', '')
-local DIR_PATH = PATH:gsub("%.", "/")
-local O = require(PATH .. '.oop')
+local PATH = (...):gsub("%.init$", "")
 
-local timeline_stack = { }
+local O          = require(PATH .. '.oop')
+local ucoroutine = require(PATH .. '.ucoroutine')
 
--- ugly hack to avoid multiple stack traces in error messages
-local debug_traceback = debug.traceback
-local ignore_traceback = 0
-function debug.traceback(...)
-  if ignore_traceback > 0 then ignore_traceback = ignore_traceback - 1; return ""
-  else                         return debug_traceback(...) end
+local current_timeline
+
+-- Error Handling --
+
+local ucoroutine_traceback = ucoroutine.traceback
+function ucoroutine.traceback()
+  if current_timeline then return ucoroutine_traceback(1)
+  else                     return ucoroutine_traceback(3) end
 end
 
-local tl_err
-local function safety_error(msg)
-  ignore_traceback = 2
-  error("Timeline Error: \n\n" .. msg, -1)
-end
-local function safety_coalesce(success, ...)
-  if not success then
-    safety_error(..., -1)
-  end
-  return ...
-end
--- this class will wrap timeline run functions in order to
--- provide better error messages
-local function safety_wrapper(f)
-  return function(...)
-    return safety_coalesce(xpcall(f, debug.traceback, ...))
+function ucoroutine.errorevent()
+  if current_timeline then
+    current_timeline._status = "Dead"
+    while current_timeline._caller do
+      local caller = current_timeline._caller
+      current_timeline._caller = nil
+      current_timeline         = caller
+    end
+    current_timeline = nil
   end
 end
 
-
-local function timeline_error(msg)
-  print(msg)
-  error(msg, -1)
-end
-local function timeline_coalesce(tl, success, ...)
-  if not success then
-    timeline_error(...)
+local function tl_assert(test, level, msg)
+  if type(level) == "string" then
+    msg   = level
+    level = 0
   end
-  if coroutine.status(tl._coroutine) == "dead" and select("#", ...) > 0 then
-    tl._results = { ... }
+  if not test then
+    error(msg, level + 1)
   end
-end
-local function timeline_resume(tl)
-  if coroutine.status(tl._coroutine) ~= "dead" then
-    timeline_coalesce(tl, coroutine.resume(tl._coroutine, unpack(tl._args)))
-  end
+  return test
 end
 
+-- Timeline --
 
--- timelines!! the heart of tle
 TL = O.Class("Timeline", function(C, MT)
   C._status      = "Suspended"
   C._is_paused   = false
@@ -84,11 +70,18 @@ TL = O.Class("Timeline", function(C, MT)
 
   function C:type   () return self._type end
   function C:_yield () coroutine.yield() end
-  function C:_resume() timeline_resume(self) end
+  function C:_resume()
+    if coroutine.status(self._coroutine) ~= "dead" then
+      return ucoroutine.resume(self._coroutine, unpack(self._args))
+    end
+    return true
+  end
 
   function C:Step()
     if self._status ~= "Dead" and not self._is_paused then
-      timeline_stack[#timeline_stack + 1] = self
+      self._caller = current_timeline
+      current_timeline = self
+
       local branch_count = #self._branches
       self._status = "Running"
       self:_resume()
@@ -108,7 +101,9 @@ TL = O.Class("Timeline", function(C, MT)
       else
         self._status = "Suspended"
       end
-      timeline_stack[#timeline_stack] = nil
+
+      current_timeline = self._caller
+      self._caller = nil
     end
     return self:IsDone()
   end
@@ -121,14 +116,14 @@ TL = O.Class("Timeline", function(C, MT)
 
   function C:Branches() return ipairs(self._branches) end
 
-  function C:Pause() 
+  function C:Pause()
     self._is_paused = true
     if self:IsRunning() then
       TL.Step()
     end
   end
   function C:Unpause()
-    self._is_paused = false 
+    self._is_paused = false
   end
   function C:IsPaused() return self._is_paused end
 
@@ -163,7 +158,7 @@ TL = O.Class("Timeline", function(C, MT)
       assert(success, "attempt to pass uncallable value to timeline constructor")
     end
 
-    self._coroutine = coroutine.create(safety_wrapper(run))
+    self._coroutine = ucoroutine.create(run)
     self._args      = { ... }
     self._results   = { }
     self._branches  = { }
@@ -176,13 +171,15 @@ package.loaded['timeline'] = TL
 
 local delta_time = 0
 local frame      = 0
+local time       = 0
 function TL.GetDT   () return delta_time end
 function TL.GetFrame() return frame end
+function TL.GetTime () return time end
 
 local loop_count = 0
 function TL.CheckInfiniteLoop(...)
   loop_count = loop_count + 1
-  if loop_count > 100000 then 
+  if loop_count > 100000 then
    error("infinite loop detected, try calling TL.Step()")
   end
   if select("#", ...) == 0 then return true
@@ -190,11 +187,28 @@ function TL.CheckInfiniteLoop(...)
 end
 
 local background_timelines = { }
-function TL.Do(run)
-  local tl = TL(run)
+function TL.Do(run, ...)
+  local tl = TL(run, ...)
   background_timelines[#background_timelines + 1] = tl
   return tl
 end
+
+function TL.Require(modl)
+  local path = modl:gsub("%.", "/")
+  local chunk
+  for searcher in package.path:gmatch("([^;]*);?") do
+    local cpath = searcher:gsub("?", path)
+    chunk = loadfile(cpath)
+    if chunk then break end
+  end
+  if not chunk then
+    chunk = loadfile("../" .. path .. ".lua")
+  end
+  assert(chunk, "cannot find module '" .. modl .. "'")
+  return TL(chunk, modl)
+end
+
+-- Timeline Peeper --
 
 local TimelinePeeper = O.Class("TimelinePeeper", TL, function(C)
   local _PEEK_FINISHED = { }
@@ -205,11 +219,11 @@ local TimelinePeeper = O.Class("TimelinePeeper", TL, function(C)
   local function peep_coalesce(tl, success, ...)
     tl:KillBranches()
     if not success then
-      if ... == _PEEK_FINISHED then 
+      if ... == _PEEK_FINISHED then
         tl._did_pass = false
         return
       else
-        timeline_error(...)
+        error(tl, ...)
       end
     end
     tl._did_pass = true
@@ -226,7 +240,7 @@ local TimelinePeeper = O.Class("TimelinePeeper", TL, function(C)
   end
 
   return function(self)
-    self._coroutine = coroutine.create(function()
+    self._coroutine = ucoroutine.create(function()
       while true do
         coroutine.yield()
         peep_coalesce(self, xpcall(self._run, debug.traceback, unpack(self._args)))
@@ -259,26 +273,37 @@ function TL.Peek(run, ...)
 end
 
 function TL.Assert(msg)
-  assert(timeline_stack[#timeline_stack], msg or "cannot call this function outside of a Timeline")
+  assert(current_timeline, msg or "cannot call this function outside of a Timeline")
 end
 
 function TL.Step()
-  TL.Assert()
-  TL.Current():_yield()
+  TL.Event.Step()
+end
+function TL.Branch(...)
+  return TL.Event.Branch(...)
 end
 
 function TL.Current()
-  return timeline_stack[#timeline_stack]
+  return current_timeline
 end
 
 -- Events --
+
+function TL.Event.Step()
+  TL.Assert()
+  TL.Current():_yield()
+end
 
 function TL.Event.Kill(n)
   n = n or 0
   TL.Assert()
   assert(n <= 0, "TL.Event.Kill only accepts negative numbers or 0")
-  assert(#timeline_stack >= -n, "attempt to kill a timeline outside of the stack")
-  timeline_stack[#timeline_stack + n]:Die()
+  local t = current_timeline
+  while n > 0 do
+    t = assert(t._caller, "attempt to kill a timeline outside of the stack")
+    n = n - 1
+  end
+  t:Die()
 end
 
 function TL.Event.Die()
@@ -288,18 +313,29 @@ end
 
 function TL.Event.Branch(run, ...)
   TL.Assert()
-  local b = TL.Current():Branch(run, ...)
-  local success, err = pcall(TL.Step, b)
-  if not success then error(err) end
-  return b
+
+  local current = TL.Current()
+  local branch  = current:Branch(run, ...)
+
+  branch:Step()
+
+  return branch
 end
 
 function TL.Event.Wait(t)
-  while t > 0 do
+  local t0 = TL.GetTime()
+  while TL.GetTime() - t0 < t do
+    TL.CheckInfiniteLoop()
     TL.Step()
-    t = t - TL.GetDT()
   end
   return t
+end
+function TL.Event.Suspend(steps)
+  local i = 0
+  while i <= steps do
+    TL.Step()
+    i = i + 1
+  end
 end
 
 function TL.Trigger.OnTimelineDone(t)
@@ -332,8 +368,8 @@ local function new_on_trigger(name, narg)
 end
 TL.Trigger.OnKeyPress     = new_on_trigger("KeyPressed",      2)
 TL.Trigger.OnMousePress   = new_on_trigger("MousePressed",    3)
-TL.Trigger.OnKeyRelease   = new_on_trigger("KeyReleased",      2)
-TL.Trigger.OnMouseRelease = new_on_trigger("MouseReleased",    3)
+TL.Trigger.OnKeyRelease   = new_on_trigger("KeyReleased",     2)
+TL.Trigger.OnMouseRelease = new_on_trigger("MouseReleased",   3)
 
 local function new_on_trigger_joystick(name, narg)
   return function(joystick, ...)
@@ -349,8 +385,8 @@ local function new_on_trigger_joystick(name, narg)
     end
   end
 end
-TL.Trigger.OnGamepadPress    = new_on_trigger_joystick("GamepadPressed",  2)
-TL.Trigger.OnJoystickPress   = new_on_trigger_joystick("JoystickPressed", 2)
+TL.Trigger.OnGamepadPress    = new_on_trigger_joystick("GamepadPressed",   2)
+TL.Trigger.OnJoystickPress   = new_on_trigger_joystick("JoystickPressed",  2)
 TL.Trigger.OnGamepadRelease  = new_on_trigger_joystick("GamepadReleased",  2)
 TL.Trigger.OnJoystickRelease = new_on_trigger_joystick("JoystickReleased", 2)
 
@@ -370,10 +406,10 @@ local function push_input_trigger(typ, ...)
   for i = #input, 1,                -1 do input[i] = nil end
   for i = 1,      select("#", ...)     do input[i] = select(i, ...) end
 end
-local triggers = { "KeyPressed", "KeyReleased", "MousePressed", "MouseReleased", "MouseMoved", 
-  "WheelMoved", "TouchPressed", "TouchReleased", "TouchMoved", "GamepadPressed", 
-  "GamepadReleased", "GamepadAxis", "JoystickPressed", "JoystickReleased", "JoystickAxis", 
-  "JoystickHat", "JoystickAdded", "JoystickRemoved", "TextInput", "Visible", "Resize", 
+local triggers = { "KeyPressed", "KeyReleased", "MousePressed", "MouseReleased", "MouseMoved",
+  "WheelMoved", "TouchPressed", "TouchReleased", "TouchMoved", "GamepadPressed",
+  "GamepadReleased", "GamepadAxis", "JoystickPressed", "JoystickReleased", "JoystickAxis",
+  "JoystickHat", "JoystickAdded", "JoystickRemoved", "TextInput", "Visible", "Resize",
   "MouseFocus", "Focus" }
 
 local function new_input_trigger(names)
@@ -396,10 +432,10 @@ local function new_input_trigger(names)
         for i = inputs.Size, 1, -1 do
           local input = inputs[i]
           if input.Type == names[j] then
-            if all == "All" then return coroutine.wrap(iterate)
+            if all == "All" then return ucoroutine.wrap(iterate)
             else
               if #names > 1 then return names[j], unpack(input)
-              else               return unpack(input) end 
+              else               return unpack(input) end
             end
           end
         end
@@ -418,13 +454,13 @@ do
     TL.Trigger[triggers[i]] = new_input_trigger(triggers[i])
   end
 
-  TL.Trigger.   MouseActivity = new_input_trigger({ "MousePressed", "MouseReleased", "MouseMoved", 
+  TL.Trigger.   MouseActivity = new_input_trigger({ "MousePressed", "MouseReleased", "MouseMoved",
                                                     "WheelMoved" })
   TL.Trigger.  WindowActivity = new_input_trigger({ "MouseFocus", "Focus", "Resize", "Visible" })
-  TL.Trigger.JoystickActivity = new_input_trigger({ "JoystickPressed", "JoystickReleased", 
-                                                    "JoystickAdded", "JoystickRemoved", 
+  TL.Trigger.JoystickActivity = new_input_trigger({ "JoystickPressed", "JoystickReleased",
+                                                    "JoystickAdded", "JoystickRemoved",
                                                     "JoystickAxis", "JoystickHat" })
-  TL.Trigger. GamepadActivity = new_input_trigger({ "GamepadPressed", "GamepadReleased", 
+  TL.Trigger. GamepadActivity = new_input_trigger({ "GamepadPressed", "GamepadReleased",
                                                     "GamepadAxis" })
   TL.Trigger.     KeyActivity = new_input_trigger({ "KeyPressed", "KeyReleased", "TextInput" })
 end
@@ -439,6 +475,7 @@ function TL.update(dt)
     end
   end
 
+  time        = time + dt
   delta_time  = dt
   frame       = frame + 1
   inputs.Size = 0
@@ -459,9 +496,9 @@ function TL.Attach()
     end
   end
 
-  local old_update = love.update or function()end
+  local love_update = love.update or function()end
   function love.update(...)
-    old_update(...)
+    love_update(...)
     TL.update(...)
   end
 end

@@ -1,6 +1,16 @@
 # TimelineEvents
 A coroutine based event system for Lua/LÖVE
 
+## Changelog
++ Added `timeline = TL.Require(path)`
++ Added `TL.Event.Suspend(steps)`
++ Added `"Timeline" = Timeline:type()`
++ Improved error handling and stack traces
+
+## Todo
+
++ Graphics
+
 ## Installation
 
 Just drop the timeline folder into your code and type:
